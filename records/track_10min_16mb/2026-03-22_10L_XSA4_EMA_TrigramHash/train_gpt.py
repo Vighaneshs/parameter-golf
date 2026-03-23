@@ -78,7 +78,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
+    mlp_mult = float(os.environ.get("MLP_MULT", 2.0))  # 2.0 with SwiGLU ≈ same params as 3.0 with relu²
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -101,6 +101,9 @@ class Hyperparameters:
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    # Cap validation tokens for fast local iteration. 0 = use full val set (default for H100 runs).
+    # Example: MAX_VAL_TOKENS=1000000 evaluates on ~1M tokens instead of 62M → ~60x faster eval.
+    max_val_tokens = int(os.environ.get("MAX_VAL_TOKENS", 0))
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -109,8 +112,19 @@ class Hyperparameters:
     trigram_vocab_size = int(os.environ.get("TRIGRAM_VOCAB_SIZE", 1024))
     trigram_dim = int(os.environ.get("TRIGRAM_DIM", 64))
 
+    # QuadgramHash: (prev3, prev2, prev1, curr) → learned embedding
+    quadgram_vocab_size = int(os.environ.get("QUADGRAM_VOCAB_SIZE", 1024))
+    quadgram_dim = int(os.environ.get("QUADGRAM_DIM", 32))
+
     # XSA: Exclusive Self Attention (arXiv:2603.09078), applied to last N layers
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
+    # Gated XSA: learned per-layer scalar gate controlling projection removal strength.
+    # sigmoid(4.0) ≈ 0.982 — starts near full XSA, adapts during training.
+    # Set XSA_GATE_INIT=100.0 to freeze near 1.0 (reproduces original hard XSA).
+    xsa_gate_init = float(os.environ.get("XSA_GATE_INIT", 4.0))
+
+    # SwiGLU: replace relu² MLP with SwiGLU gated activation (use mlp_mult=2.0 for same params)
+    use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "1")))
 
     # EMA: Exponential Moving Average weight averaging (replaces SWA)
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
@@ -319,7 +333,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale,trigram.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale,trigram.scale,quadgram.scale,xsa_gate",
     ).split(",")
     if pattern
 )
@@ -356,6 +370,8 @@ def _classify_param(name: str) -> str:
         return "embed"
     if ".mlp." in name:
         return "mlp"
+    if "quadgram" in name:
+        return "quadgram"
     if "trigram" in name:
         return "trigram"
     if "bigram" in name:
@@ -557,7 +573,7 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float,
-                 use_xsa: bool = False):
+                 use_xsa: bool = False, xsa_gate_init: float = 4.0):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -577,6 +593,10 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        # Gated XSA: one learned scalar per XSA layer controlling projection-removal strength.
+        # sigmoid(xsa_gate_init=4.0) ≈ 0.982 → starts near full XSA, adapts per layer during training.
+        if use_xsa:
+            self.xsa_gate = nn.Parameter(torch.tensor(xsa_gate_init, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -598,8 +618,9 @@ class CausalSelfAttention(nn.Module):
             y = F.scaled_dot_product_attention(q, k, v_sdpa, attn_mask=None, is_causal=True)
         else:
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
-        # XSA: Exclusive Self Attention (arXiv:2603.09078)
-        # Removes the component of each output y_i that lies along its own value v_i.
+        # Gated XSA: Exclusive Self Attention (arXiv:2603.09078) with learned gate.
+        # Removes gate * (component of y_i along its own value v_i), where gate = sigmoid(xsa_gate).
+        # gate ≈ 1.0 at init → full XSA; gate adapts per layer during training.
         # GQA-aware: groups query heads by KV head to avoid repeat_interleave allocation.
         if self.use_xsa:
             gs = self.num_heads // self.num_kv_heads
@@ -607,21 +628,32 @@ class CausalSelfAttention(nn.Module):
             Vn = Vn.unsqueeze(2)                                    # (B, Hkv, 1,  S, Dh)
             y_g = y.reshape(bsz, self.num_kv_heads, gs, seqlen, self.head_dim)  # (B, Hkv, gs, S, Dh)
             dot = (y_g * Vn).sum(dim=-1, keepdim=True)             # (B, Hkv, gs, S, 1)
-            y_g = y_g - dot * Vn                                    # (B, Hkv, gs, S, Dh)
+            gate = torch.sigmoid(self.xsa_gate).to(dtype=y_g.dtype)
+            y_g = y_g - gate * dot * Vn                             # (B, Hkv, gs, S, Dh)
             y = y_g.reshape(bsz, self.num_heads, seqlen, self.head_dim)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: float):
+    def __init__(self, dim: int, mlp_mult: float, use_swiglu: bool = True):
         super().__init__()
         hidden = int(mlp_mult * dim)
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        self.use_swiglu = use_swiglu
+        if use_swiglu:
+            # SwiGLU: gate + up projections, then down. With mlp_mult=2.0 matches relu² mlp_mult=3.0 param count.
+            self.gate = CastedLinear(dim, hidden, bias=False)
+            self.up = CastedLinear(dim, hidden, bias=False)
+            self.down = CastedLinear(hidden, dim, bias=False)
+            self.down._zero_init = True
+        else:
+            self.fc = CastedLinear(dim, hidden, bias=False)
+            self.proj = CastedLinear(hidden, dim, bias=False)
+            self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.use_swiglu:
+            return self.down(F.silu(self.gate(x)) * self.up(x))
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
@@ -700,14 +732,47 @@ class TrigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 
+class QuadgramHashEmbedding(nn.Module):
+    """Hash 4 consecutive tokens into a learned embedding table.
+
+    Hash: (prev3*104723 + prev2*9533 + prev1*97 + curr) % quadgram_vocab_size.
+    Max value: 104723*1023 + 9533*1023 + 97*1023 + 1023 = 116,984,142 — safely within int32.
+    Extends TrigramHash with 4-gram context at zero attention overhead.
+    """
+    def __init__(self, quadgram_vocab_size: int, quadgram_dim: int, model_dim: int):
+        super().__init__()
+        self.quadgram_vocab_size = quadgram_vocab_size
+        self.embed = nn.Embedding(quadgram_vocab_size, quadgram_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(quadgram_dim, model_dim, bias=False) if quadgram_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def quadgram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)  # int32 for MPS compat (max value ~117M fits in int32)
+        mod = self.quadgram_vocab_size
+        out = torch.full_like(t, mod - 1)  # sentinel for positions without full 4-gram context
+        if t.shape[-1] > 3:
+            out[..., 3:] = (104723 * t[..., :-3] + 9533 * t[..., 1:-2] + 97 * t[..., 2:-1] + t[..., 3:]) % mod
+        return out.long()
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(self.quadgram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
+
+
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float,
-                 qk_gain_init: float, use_xsa: bool = False):
+                 qk_gain_init: float, use_xsa: bool = False, use_swiglu: bool = True, xsa_gate_init: float = 4.0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, use_xsa=use_xsa)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                        use_xsa=use_xsa, xsa_gate_init=xsa_gate_init)
+        self.mlp = MLP(dim, mlp_mult, use_swiglu=use_swiglu)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -739,7 +804,11 @@ class GPT(nn.Module):
         bigram_dim: int = 128,
         trigram_vocab_size: int = 0,
         trigram_dim: int = 64,
+        quadgram_vocab_size: int = 0,
+        quadgram_dim: int = 32,
         xsa_last_n: int = 0,
+        xsa_gate_init: float = 4.0,
+        use_swiglu: bool = True,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -750,6 +819,7 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.trigram = TrigramHashEmbedding(trigram_vocab_size, trigram_dim, model_dim) if trigram_vocab_size > 0 else None
+        self.quadgram = QuadgramHashEmbedding(quadgram_vocab_size, quadgram_dim, model_dim) if quadgram_vocab_size > 0 else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -758,7 +828,9 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList(
             [
                 Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                      use_xsa=(xsa_last_n > 0 and i >= num_layers - xsa_last_n))
+                      use_xsa=(xsa_last_n > 0 and i >= num_layers - xsa_last_n),
+                      use_swiglu=use_swiglu,
+                      xsa_gate_init=xsa_gate_init)
                 for i in range(num_layers)
             ]
         )
@@ -788,6 +860,8 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         if self.trigram is not None:
             x = x + self.trigram(input_ids)
+        if self.quadgram is not None:
+            x = x + self.quadgram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         return self.smear(x)
 
@@ -1003,6 +1077,9 @@ def main() -> None:
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    if args.max_val_tokens > 0:
+        usable = (min(args.max_val_tokens, val_tokens.numel() - 1) // args.train_seq_len) * args.train_seq_len
+        val_tokens = val_tokens[: usable + 1]
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
@@ -1028,7 +1105,11 @@ def main() -> None:
         bigram_dim=args.bigram_dim,
         trigram_vocab_size=args.trigram_vocab_size,
         trigram_dim=args.trigram_dim,
+        quadgram_vocab_size=args.quadgram_vocab_size,
+        quadgram_dim=args.quadgram_dim,
         xsa_last_n=args.xsa_last_n,
+        xsa_gate_init=args.xsa_gate_init,
+        use_swiglu=args.use_swiglu,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1067,6 +1148,12 @@ def main() -> None:
             matrix_params.append(base_model.trigram.proj.weight)
         scalar_params.append(base_model.trigram.scale)
 
+    if base_model.quadgram is not None:
+        tok_params.append({"params": [base_model.quadgram.embed.weight], "lr": token_lr, "base_lr": token_lr})
+        if base_model.quadgram.proj is not None:
+            matrix_params.append(base_model.quadgram.proj.weight)
+        scalar_params.append(base_model.quadgram.scale)
+
     optimizer_tok = torch.optim.AdamW(
         tok_params,
         betas=(args.beta1, args.beta2),
@@ -1104,7 +1191,8 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"num_layers:{args.num_layers} model_dim:{args.model_dim} mlp_mult:{args.mlp_mult}")
-    log0(f"bigram:{args.bigram_vocab_size}x{args.bigram_dim} trigram:{args.trigram_vocab_size}x{args.trigram_dim}")
+    log0(f"bigram:{args.bigram_vocab_size}x{args.bigram_dim} trigram:{args.trigram_vocab_size}x{args.trigram_dim} quadgram:{args.quadgram_vocab_size}x{args.quadgram_dim}")
+    log0(f"swiglu:{args.use_swiglu} mlp_mult:{args.mlp_mult} xsa_last_n:{args.xsa_last_n} xsa_gate_init:{args.xsa_gate_init}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -1308,7 +1396,7 @@ def main() -> None:
 
     # Mixed int5(MLP)/int6(attn,bigram,trigram) quantization + zstd/zlib export
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn", "bigram", "trigram"})
+    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn", "bigram", "trigram", "quadgram"})
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
